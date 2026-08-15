@@ -7,12 +7,13 @@ import {
   type CmoAction,
 } from "@/lib/cmo-chat";
 import { CursorCmoError, runCursorCmo } from "@/lib/cursor-cmo";
+import { executePlanStepWithSubagent } from "@/lib/plan-subagent";
 import { dispatch, getState } from "@/lib/store";
 import type { MadeThisState } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 180;
 
 const requestSchema = z
   .object({
@@ -72,7 +73,14 @@ export async function POST(request: Request) {
     const command = output.plan
       ? ({ type: "create_marketing_plan", draft: output.plan } as const)
       : commandForCmoAction(output.requestedAction, current);
-    const state = command ? dispatch(command) : current;
+    const state =
+      command?.type === "execute_plan_step"
+        ? await executePlanStepWithSubagent(command.planId, command.stepId, {
+            signal: request.signal,
+          })
+        : command
+          ? dispatch(command)
+          : current;
     const marketingPlan = output.plan
       ? state.marketingPlans.find((item) => item.id === state.activeMarketingPlanId)
       : undefined;

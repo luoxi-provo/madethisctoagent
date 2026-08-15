@@ -101,6 +101,130 @@ describe("MadeThis CMO deterministic marketing loop", () => {
       "company.researched",
       "marketing_plan.created",
     ]);
+    expect(state.marketingPlans[0].steps[0]).toMatchObject({
+      actionType: "linkedin_prospect_search",
+      priority: 1,
+      title: "Find prospect clients on LinkedIn",
+    });
+    expect(state.lastNotice?.message).toContain("Market evidence is still being checked");
+  });
+
+  it("applies market evidence to the open workspace without blocking the founder", () => {
+    const opened = commandReducer(
+      createInitialState(start),
+      { type: "onboard_company", profile: companyProfile, draft: marketingPlanDraft },
+      minute(1),
+    );
+    const enriched: CompanyProfile = {
+      ...companyProfile,
+      category: "Issue tracking",
+      competitors: ["Jira"],
+      marketSignals: ["Teams want faster planning loops", "Issue tracking is consolidating"],
+      sources: [{ title: "Linear blog", url: "https://linear.app/blog" }],
+    };
+    const state = commandReducer(
+      opened,
+      {
+        type: "apply_market_evidence",
+        profile: enriched,
+        draft: {
+          ...marketingPlanDraft,
+          title: "Evidence-backed launch plan",
+          objective: "Win issue-tracking teams already switching tools",
+        },
+      },
+      minute(2),
+    );
+
+    expect(state.companyProfile?.category).toBe("Issue tracking");
+    expect(state.companyProfile?.competitors).toEqual(["Jira"]);
+    expect(state.marketingPlans[0].title).toBe("Evidence-backed launch plan");
+    expect(state.marketingPlans[0].steps[0].actionType).toBe("linkedin_prospect_search");
+    expect(state.activity.some((event) => event.type === "market.evidence_updated")).toBe(true);
+    expect(state.lastNotice?.message).toContain("Market evidence updated");
+  });
+
+  it("does not replace a plan the founder already started when market evidence arrives", () => {
+    const opened = commandReducer(
+      createInitialState(start),
+      { type: "onboard_company", profile: companyProfile, draft: marketingPlanDraft },
+      minute(1),
+    );
+    const started = commandReducer(
+      opened,
+      { type: "execute_plan_step", planId: "MP-001", stepId: "MP-001-S1" },
+      minute(2),
+    );
+    const state = commandReducer(
+      started,
+      {
+        type: "apply_market_evidence",
+        profile: {
+          ...companyProfile,
+          marketSignals: ["New public signal", "Second public signal"],
+        },
+        draft: { ...marketingPlanDraft, title: "Should not replace" },
+      },
+      minute(3),
+    );
+
+    expect(state.marketingPlans[0].title).toBe(started.marketingPlans[0].title);
+    expect(state.marketingPlans[0].steps[0].status).toBe("completed");
+    expect(state.companyProfile?.marketSignals[0]).toBe("New public signal");
+  });
+
+  it("executes LinkedIn prospect search as the first plan task and scores buyer status", () => {
+    const planned = commandReducer(
+      createInitialState(start),
+      { type: "onboard_company", profile: companyProfile, draft: marketingPlanDraft },
+      minute(1),
+    );
+    const state = commandReducer(
+      planned,
+      { type: "execute_plan_step", planId: "MP-001", stepId: "MP-001-S1" },
+      minute(2),
+    );
+    const linkedInProspects = state.opportunities.filter((item) => item.source === "linkedin_search");
+
+    expect(state.marketingPlans[0].steps[0]).toMatchObject({
+      status: "completed",
+      actionType: "linkedin_prospect_search",
+    });
+    expect(state.marketingPlans[0].steps[0].executionNote).toContain("No live LinkedIn messages were sent");
+    expect(linkedInProspects.length).toBeGreaterThan(0);
+    expect(linkedInProspects[0].prospectStatus).toBeTruthy();
+    expect(linkedInProspects[0].prospectStage).toBeTruthy();
+    expect(state.activity.some((event) => event.type === "linkedin.prospects_scored")).toBe(true);
+  });
+
+  it("records a spawned subagent result on the completed plan priority", () => {
+    const planned = commandReducer(
+      createInitialState(start),
+      { type: "create_marketing_plan", draft: marketingPlanDraft },
+      minute(1),
+    );
+    const state = commandReducer(
+      planned,
+      {
+        type: "execute_plan_step",
+        planId: "MP-001",
+        stepId: "MP-001-S1",
+        subagent: {
+          name: "linkedin-prospector",
+          summary: "Found six in-market clinic operators.",
+          findings: ["Northwell Clinics is hiring a patient-experience lead"],
+          statusRead: "Top prospects are hiring or actively posting about no-shows.",
+        },
+      },
+      minute(2),
+    );
+
+    expect(state.marketingPlans[0].steps[0].subagent).toMatchObject({
+      name: "linkedin-prospector",
+      summary: "Found six in-market clinic operators.",
+    });
+    expect(state.marketingPlans[0].steps[0].executionNote).toContain("Subagent linkedin-prospector");
+    expect(state.activity.some((event) => event.type === "subagent.completed")).toBe(true);
   });
 
   it("forgets the prior company and all communicated agent state for a new user", () => {
@@ -138,10 +262,12 @@ describe("MadeThis CMO deterministic marketing loop", () => {
       priority: step.priority,
       difficulty: step.difficulty,
       status: step.status,
+      actionType: step.actionType,
     }))).toEqual([
-      { id: "MP-001-S1", priority: 1, difficulty: "easy", status: "ready" },
-      { id: "MP-001-S2", priority: 2, difficulty: "medium", status: "ready" },
-      { id: "MP-001-S3", priority: 3, difficulty: "easy", status: "ready" },
+      { id: "MP-001-S1", priority: 1, difficulty: "easy", status: "ready", actionType: "linkedin_prospect_search" },
+      { id: "MP-001-S2", priority: 2, difficulty: "easy", status: "ready", actionType: "research_brief" },
+      { id: "MP-001-S3", priority: 3, difficulty: "medium", status: "ready", actionType: "funnel_analysis" },
+      { id: "MP-001-S4", priority: 4, difficulty: "easy", status: "ready", actionType: "content_draft" },
     ]);
     expect(state.executions).toHaveLength(0);
   });
@@ -155,19 +281,19 @@ describe("MadeThis CMO deterministic marketing loop", () => {
     const beforeProgress = planned.workstreams.find((item) => item.id === "content")!.progress;
     const state = commandReducer(
       planned,
-      { type: "execute_plan_step", planId: "MP-001", stepId: "MP-001-S3" },
+      { type: "execute_plan_step", planId: "MP-001", stepId: "MP-001-S4" },
       minute(2),
     );
 
     expect(state.marketingPlans[0]).toMatchObject({
       status: "in_progress",
-      selectedStepId: "MP-001-S3",
+      selectedStepId: "MP-001-S4",
     });
-    expect(state.marketingPlans[0].steps[2]).toMatchObject({
+    expect(state.marketingPlans[0].steps[3]).toMatchObject({
       status: "completed",
       difficulty: "easy",
     });
-    expect(state.marketingPlans[0].steps[2].executionNote).toContain(
+    expect(state.marketingPlans[0].steps[3].executionNote).toContain(
       "No live external action was taken",
     );
     expect(state.workstreams.find((item) => item.id === "content")!.progress).toBe(
@@ -199,12 +325,16 @@ describe("MadeThis CMO deterministic marketing loop", () => {
     );
 
     const plan = state.marketingPlans[0];
-    expect(plan.autoExecutedStepId).toBe("MP-001-S2");
-    expect(plan.steps.map((step) => step.status)).toEqual(["ready", "completed", "ready"]);
-    expect(plan.steps[0].difficulty).toBe("medium");
-    expect(plan.steps[1].difficulty).toBe("easy");
+    expect(plan.steps[0]).toMatchObject({
+      actionType: "linkedin_prospect_search",
+      difficulty: "easy",
+    });
+    expect(plan.autoExecutedStepId).toBe("MP-001-S1");
+    expect(plan.steps.map((step) => step.status)).toEqual(["completed", "ready", "ready", "ready"]);
+    expect(plan.steps[1].difficulty).toBe("medium");
     expect(state.executions).toHaveLength(0);
-    expect(state.lastNotice?.message).toContain("priority 2 is complete");
+    expect(state.lastNotice?.message).toContain("priority 1 is complete");
+    expect(state.opportunities.some((item) => item.source === "linkedin_search")).toBe(true);
   });
 
   it("blocks plan execution while the CMO is paused and keeps an audit reason", () => {

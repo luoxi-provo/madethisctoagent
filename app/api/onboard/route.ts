@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  buildCompanyResearchPrompt,
+  buildMarketEvidencePrompt,
   companyResearchOutputSchema,
   extractWebsite,
   fetchWebsiteSnapshot,
+  identifyCompanyFromBrief,
   parseCompanyResearchOutput,
   researchPlan,
+  starterMarketingPlan,
   toCompanyProfile,
 } from "@/lib/company-research";
 import {
@@ -56,6 +58,7 @@ export async function POST(request: Request) {
       };
 
       void (async () => {
+        let workspaceOpened = false;
         try {
           progress({
             id: "brief",
@@ -70,9 +73,18 @@ export async function POST(request: Request) {
               detail: new URL(suppliedWebsite).hostname,
             });
           }
-          const website = suppliedWebsite
-            ? await fetchWebsiteSnapshot(suppliedWebsite)
-            : undefined;
+          let website: Awaited<ReturnType<typeof fetchWebsiteSnapshot>> | undefined;
+          if (suppliedWebsite) {
+            try {
+              website = await fetchWebsiteSnapshot(suppliedWebsite);
+            } catch {
+              progress({
+                id: "website-skip",
+                title: "Continuing from the brief",
+                detail: "The website could not be read; identifying the company from what you wrote",
+              });
+            }
+          }
           if (website) {
             progress({
               id: "website-read",
@@ -80,7 +92,31 @@ export async function POST(request: Request) {
               detail: website.title || website.url,
             });
           }
-          const researchPrompt = buildCompanyResearchPrompt(input.message, website);
+
+          const researchedAt = new Date().toISOString();
+          const identified = identifyCompanyFromBrief(input.message, researchedAt, website);
+          progress({
+            id: "company",
+            title: "Company identified",
+            detail: identified.name,
+          });
+          const opened = dispatch({
+            type: "onboard_company",
+            profile: identified,
+            draft: starterMarketingPlan(identified),
+          });
+          workspaceOpened = true;
+          send({
+            type: "workspace",
+            reply: `I’ve opened the ${identified.name} workspace from your brief. I’m still checking market evidence and will update the plan.`,
+            profile: identified,
+            marketingPlan: opened.marketingPlans.find((plan) => plan.id === opened.activeMarketingPlanId),
+            state: opened,
+            engine: "cursor-cli",
+            researchPending: true,
+          });
+
+          const researchPrompt = buildMarketEvidencePrompt(input.message, identified, website);
           const runResearch = () =>
             runCursorStructured(
               researchPrompt,
@@ -88,7 +124,7 @@ export async function POST(request: Request) {
               parseCompanyResearchOutput,
               {
                 signal: request.signal,
-                timeoutMs: 75_000,
+                timeoutMs: 150_000,
                 onProgress: progress,
               },
             );
@@ -112,25 +148,22 @@ export async function POST(request: Request) {
           const profile = toCompanyProfile(
             output,
             input.message,
-            new Date().toISOString(),
-            website?.url ?? suppliedWebsite,
+            researchedAt,
+            website?.url ?? suppliedWebsite ?? identified.website,
           );
           const state = dispatch({
-            type: "onboard_company",
+            type: "apply_market_evidence",
             profile,
             draft: researchPlan(output),
           });
-          const marketingPlan = state.marketingPlans.find(
-            (plan) => plan.id === state.activeMarketingPlanId,
-          );
-
           send({
             type: "result",
             reply: output.reply,
             profile,
-            marketingPlan,
+            marketingPlan: state.marketingPlans.find((plan) => plan.id === state.activeMarketingPlanId),
             state,
             engine: "cursor-cli",
+            researchPending: false,
           });
         } catch (error) {
           const message =
@@ -139,7 +172,7 @@ export async function POST(request: Request) {
               : error instanceof Error
                 ? error.message
                 : "MadeThis CMO could not research this company.";
-          send({ type: "error", message });
+          send(workspaceOpened ? { type: "research_error", message } : { type: "error", message });
         } finally {
           if (!closed) controller.close();
           closed = true;

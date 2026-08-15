@@ -1,16 +1,38 @@
 import "server-only";
 
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cmoOutputSchema, parseCmoOutput, type CmoOutput } from "./cmo-chat";
 
 const runtimeDirectory = path.join(os.tmpdir(), "madethis-cmo-cursor");
 const MAX_OUTPUT_BYTES = 1_000_000;
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 150_000;
 
 mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
+
+function installLinkedInSearchSkill() {
+  const source = path.join(process.cwd(), ".cursor/skills/linkedin-search/SKILL.md");
+  if (!existsSync(source)) return;
+  const destDir = path.join(runtimeDirectory, ".cursor", "skills", "linkedin-search");
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  copyFileSync(source, path.join(destDir, "SKILL.md"));
+}
+
+function installProjectCursorFiles() {
+  installLinkedInSearchSkill();
+  const sourceDir = path.join(process.cwd(), ".cursor/agents");
+  if (!existsSync(sourceDir)) return;
+  const destDir = path.join(runtimeDirectory, ".cursor", "agents");
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  for (const file of readdirSync(sourceDir)) {
+    if (!file.endsWith(".md")) continue;
+    copyFileSync(path.join(sourceDir, file), path.join(destDir, file));
+  }
+}
+
+installProjectCursorFiles();
 
 export class CursorCmoError extends Error {
   constructor(message: string) {
@@ -392,9 +414,29 @@ Return one JSON object matching the schema exactly. Do not wrap it in markdown o
       finish(() => reject(new CursorCmoError("The Cursor Agent turn was cancelled.")));
     };
 
+    const tryParsePartial = (raw: string) => {
+      if (!raw.trim()) return undefined;
+      try {
+        return parse(cleanJsonOutput(raw));
+      } catch {
+        return undefined;
+      }
+    };
+
     const timeout = setTimeout(() => {
+      const parsed = tryParsePartial(streamResult) ?? tryParsePartial(stdout);
       stop();
-      finish(() => reject(new CursorCmoError("Cursor Agent CLI took too long to respond.")));
+      if (parsed) {
+        finish(() => resolve(parsed));
+        return;
+      }
+      finish(() =>
+        reject(
+          new CursorCmoError(
+            "Cursor Agent CLI took too long to respond. Try a shorter company brief, or run the task again.",
+          ),
+        ),
+      );
     }, timeoutMs);
     timeout.unref();
 

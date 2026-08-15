@@ -32,10 +32,10 @@ The implementation passes only when the changed connector and play can be traced
 | ENG-14 | Approve and roll back an inferred play patch. | Approval creates immutable v2 metadata; rollback restores v1 without deleting history. |
 | ENG-15 | Run another heartbeat while a proposal is pending. | No duplicate proposal is created. |
 | ENG-16 | Present a heartbeat as already locked. | A second worker cannot claim work or create a proposal. |
-| ENG-17 | Create a 3–5 step plan in Propose mode. | A durable `MP-###` plan preserves Codex priority order, receives stable step IDs, and remains `awaiting_choice`. |
+| ENG-17 | Create a 3–5 step plan in Propose mode. | A durable `MP-###` plan starts with LinkedIn prospect search, preserves remaining Codex priority order, receives stable step IDs, and remains `awaiting_choice`. |
 | ENG-18 | Inspect plan difficulty. | Difficulty is derived from the code-owned action policy, never accepted from model output. |
 | ENG-19 | Select a ready plan priority. | The step completes, its workstream advances, and the audit trail states that no live external action occurred. |
-| ENG-20 | Create a plan in Autopilot mode. | Exactly the highest-ranked code-approved easy internal step completes; medium steps remain ready and no outbound execution receipt is created. |
+| ENG-20 | Create a plan in Autopilot mode. | The first LinkedIn prospecting step completes automatically as easy internal work; medium steps remain ready and no outbound execution receipt is created. |
 | ENG-21 | Select a plan priority while paused. | The step is blocked with a durable reason and may not advance its workstream. |
 
 Run with:

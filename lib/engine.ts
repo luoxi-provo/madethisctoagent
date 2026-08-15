@@ -13,6 +13,12 @@ import type {
   Proposal,
   RelationshipPath,
 } from "./types";
+import {
+  applyLinkedInProspects,
+  prospectSearchSummary,
+  searchLinkedInProspects,
+  withProspectingFirstStep,
+} from "./linkedin-search";
 
 const BASE_COOLDOWN_DAYS = 14;
 
@@ -20,6 +26,11 @@ const PLAN_ACTION_POLICY: Record<
   MarketingPlanActionType,
   { difficulty: MarketingPlanStep["difficulty"]; progress: number; label: string }
 > = {
+  linkedin_prospect_search: {
+    difficulty: "easy",
+    progress: 9,
+    label: "LinkedIn prospect search completed and buyer status scored",
+  },
   research_brief: {
     difficulty: "easy",
     progress: 7,
@@ -703,6 +714,7 @@ function executeMarketingPlanStep(
   step: MarketingPlanStep,
   authority: "user" | "autopilot",
   now: Date,
+  subagent?: MarketingPlanStep["subagent"],
 ) {
   if (step.status === "completed") {
     state.lastNotice = {
@@ -745,10 +757,42 @@ function executeMarketingPlanStep(
   }
 
   if (step.actionType === "run_heartbeat") runHeartbeat(state, now);
+  let linkedInNote = "";
+  if (step.actionType === "linkedin_prospect_search") {
+    const prospects = searchLinkedInProspects(state.companyProfile);
+    state.opportunities = applyLinkedInProspects(state.opportunities, prospects);
+    linkedInNote = prospectSearchSummary(prospects);
+    if (prospects[0]) {
+      state.activeOpportunityId = `opp-${prospects[0].id}`;
+      applyPolicies(state, state.activeOpportunityId);
+    }
+    addEvent(state, now, {
+      actor: "agent",
+      type: "linkedin.prospects_scored",
+      title: "LinkedIn prospect status scored",
+      detail: linkedInNote,
+      correlationId: step.id,
+      tone: "positive",
+    });
+  }
 
   step.status = "completed";
   step.completedAt = timestamp(now);
-  step.executionNote = `${policy.label}. No live external action was taken.`;
+  step.executionNote = linkedInNote
+    ? `${policy.label}. ${linkedInNote} No live LinkedIn messages were sent.`
+    : `${policy.label}. No live external action was taken.`;
+  if (subagent) {
+    step.subagent = subagent;
+    step.executionNote = `${step.executionNote} Subagent ${subagent.name}: ${subagent.summary}`;
+    addEvent(state, now, {
+      actor: "agent",
+      type: "subagent.completed",
+      title: `Spawned ${subagent.name} for priority ${step.priority}`,
+      detail: subagent.statusRead,
+      correlationId: step.id,
+      tone: "positive",
+    });
+  }
   const workstream = state.workstreams.find((item) => item.id === step.workstream);
   if (workstream) {
     workstream.progress = Math.min(100, workstream.progress + policy.progress);
@@ -772,24 +816,25 @@ function executeMarketingPlanStep(
 }
 
 function createMarketingPlan(state: MadeThisState, draft: MarketingPlanDraft, now: Date) {
-  if (draft.steps.length < 3 || draft.steps.length > 5) {
+  const normalized = withProspectingFirstStep(draft, state.companyProfile);
+  if (normalized.steps.length < 3 || normalized.steps.length > 5) {
     throw new Error("A marketing plan must contain three to five priorities");
   }
-  if (!draft.steps.some((step) => marketingPlanDifficulty(step.actionType) === "easy")) {
+  if (!normalized.steps.some((step) => marketingPlanDifficulty(step.actionType) === "easy")) {
     throw new Error("A marketing plan must include at least one safe easy priority");
   }
 
   const id = `MP-${pad(state.marketingPlans.length + 1)}`;
   const plan: MarketingPlan = {
     id,
-    title: draft.title,
-    objective: draft.objective,
-    summary: draft.summary,
-    feedbackQuestion: draft.feedbackQuestion,
+    title: normalized.title,
+    objective: normalized.objective,
+    summary: normalized.summary,
+    feedbackQuestion: normalized.feedbackQuestion,
     status: "awaiting_choice",
     source: "cursor-cli",
     createdAt: timestamp(now),
-    steps: draft.steps.map((step, index) => ({
+    steps: normalized.steps.map((step, index) => ({
       ...step,
       id: `${id}-S${index + 1}`,
       priority: index + 1,
@@ -820,6 +865,71 @@ function createMarketingPlan(state: MadeThisState, draft: MarketingPlanDraft, no
   state.lastNotice = {
     tone: "info",
     message: `${plan.id} is prioritized. Choose which step to execute in the CMO chat.`,
+  };
+}
+
+function planCanBeReplaced(plan?: MarketingPlan) {
+  return Boolean(
+    plan &&
+      plan.status === "awaiting_choice" &&
+      !plan.selectedStepId &&
+      !plan.autoExecutedStepId &&
+      plan.steps.every((step) => step.status === "ready"),
+  );
+}
+
+function replaceMarketingPlan(state: MadeThisState, draft: MarketingPlanDraft, now: Date) {
+  const active = state.marketingPlans.find((item) => item.id === state.activeMarketingPlanId);
+  if (!planCanBeReplaced(active)) return;
+  const normalized = withProspectingFirstStep(draft, state.companyProfile);
+  if (normalized.steps.length < 3 || normalized.steps.length > 5) {
+    throw new Error("A marketing plan must contain three to five priorities");
+  }
+  if (!normalized.steps.some((step) => marketingPlanDifficulty(step.actionType) === "easy")) {
+    throw new Error("A marketing plan must include at least one safe easy priority");
+  }
+  active!.title = normalized.title;
+  active!.objective = normalized.objective;
+  active!.summary = normalized.summary;
+  active!.feedbackQuestion = normalized.feedbackQuestion;
+  active!.steps = normalized.steps.map((step, index) => ({
+    ...step,
+    id: `${active!.id}-S${index + 1}`,
+    priority: index + 1,
+    difficulty: marketingPlanDifficulty(step.actionType),
+    status: "ready",
+  }));
+  addEvent(state, now, {
+    actor: "agent",
+    type: "marketing_plan.updated",
+    title: `${active!.id}: ${active!.title}`,
+    detail: `Market evidence refreshed ${active!.steps.length} priorities for “${active!.objective}”.`,
+    correlationId: active!.id,
+    tone: "positive",
+  });
+}
+
+function applyMarketEvidence(
+  state: MadeThisState,
+  profile: CompanyProfile,
+  draft: MarketingPlanDraft,
+  now: Date,
+) {
+  const originalBrief = state.companyProfile?.originalBrief ?? profile.originalBrief;
+  const researchedAt = state.companyProfile?.researchedAt ?? profile.researchedAt;
+  state.companyProfile = clone({ ...profile, originalBrief, researchedAt });
+  state.workspace = profile.name;
+  addEvent(state, now, {
+    actor: "agent",
+    type: "market.evidence_updated",
+    title: `Market evidence updated ${profile.name}`,
+    detail: `Checked public market sources and refreshed the ${profile.category} brief.`,
+    tone: "positive",
+  });
+  replaceMarketingPlan(state, draft, now);
+  state.lastNotice = {
+    tone: "success",
+    message: `Market evidence updated the ${profile.name} brief and GTM plan.`,
   };
 }
 
@@ -857,10 +967,14 @@ export function commandReducer(
       actor: "agent",
       type: "company.researched",
       title: `${command.profile.name} workspace created`,
-      detail: `Researched ${command.profile.industry} and synthesized the initial go-to-market brief.`,
+      detail: `Opened the ${command.profile.name} workspace from the company brief. Market evidence can still be checked in the background.`,
       tone: "positive",
     });
     createMarketingPlan(fresh, command.draft, now);
+    fresh.lastNotice = {
+      tone: "info",
+      message: `${command.profile.name} workspace is open. Market evidence is still being checked.`,
+    };
     return fresh;
   }
   const state = clone(input);
@@ -938,6 +1052,9 @@ export function commandReducer(
         tone: "neutral",
       });
       break;
+    case "apply_market_evidence":
+      applyMarketEvidence(state, command.profile, command.draft, now);
+      break;
     case "create_marketing_plan":
       createMarketingPlan(state, command.draft, now);
       break;
@@ -945,7 +1062,7 @@ export function commandReducer(
       const plan = state.marketingPlans.find((item) => item.id === command.planId);
       const step = plan?.steps.find((item) => item.id === command.stepId);
       if (!plan || !step) throw new Error("Marketing plan priority not found");
-      executeMarketingPlanStep(state, plan, step, "user", now);
+      executeMarketingPlanStep(state, plan, step, "user", now, command.subagent);
       break;
     }
     case "disable_rule": {

@@ -20,6 +20,7 @@ import {
   History,
   LayoutDashboard,
   Lightbulb,
+  Linkedin,
   LockKeyhole,
   Menu,
   MessageSquare,
@@ -55,10 +56,11 @@ import type {
 type Nav = "command" | "playbook" | "activity";
 
 type OnboardingApiResponse = {
-  type: "result";
+  type: "workspace" | "result";
   reply: string;
   state: MadeThisState;
   engine: "cursor-cli";
+  researchPending?: boolean;
 };
 
 type OnboardingProgress = {
@@ -67,6 +69,30 @@ type OnboardingProgress = {
   detail: string;
   status: "active" | "complete" | "error";
 };
+
+type MarketResearchStatus = {
+  active: boolean;
+  elapsed: number;
+  events: OnboardingProgress[];
+  transcript: string;
+  error?: string;
+  completedReply?: string;
+};
+
+const ONBOARD_HOLD_MS = 10_000;
+
+function upsertProgress(
+  current: OnboardingProgress[],
+  event: Omit<OnboardingProgress, "status">,
+): OnboardingProgress[] {
+  const completed = current.map((item) =>
+    item.status === "active" ? { ...item, status: "complete" as const } : item,
+  );
+  const existing = completed.findIndex((item) => item.id === event.id);
+  const next = { ...event, status: "active" as const };
+  if (existing < 0) return [...completed, next];
+  return [...completed.filter((_, index) => index !== existing), next];
+}
 
 const actorIcons = {
   agent: Bot,
@@ -114,13 +140,22 @@ function StatusPill({ children, tone = "neutral" }: { children: React.ReactNode;
   return <span className={`pill pill-${tone}`}>{children}</span>;
 }
 
-function Onboarding({ onComplete }: { onComplete: (state: MadeThisState) => void }) {
+function Onboarding({
+  researching,
+  elapsed,
+  agentEvents,
+  agentTranscript,
+  error,
+  onSubmit,
+}: {
+  researching: boolean;
+  elapsed: number;
+  agentEvents: OnboardingProgress[];
+  agentTranscript: string;
+  error?: string;
+  onSubmit: (message: string) => void;
+}) {
   const [input, setInput] = useState("");
-  const [researching, setResearching] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [agentEvents, setAgentEvents] = useState<OnboardingProgress[]>([]);
-  const [agentTranscript, setAgentTranscript] = useState("");
-  const [error, setError] = useState<string>();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const eventsRef = useRef<HTMLDivElement>(null);
   const latestEvent = agentEvents.at(-1);
@@ -130,97 +165,15 @@ function Onboarding({ onComplete }: { onComplete: (state: MadeThisState) => void
   }, []);
 
   useEffect(() => {
-    if (!researching) return;
-    const timer = window.setInterval(() => {
-      setElapsed((current) => current + 1);
-    }, 1_000);
-    return () => window.clearInterval(timer);
-  }, [researching]);
-
-  useEffect(() => {
     const container = eventsRef.current;
     if (!container) return;
     container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
   }, [agentEvents, agentTranscript]);
 
-  function recordProgress(event: Omit<OnboardingProgress, "status">) {
-    setAgentEvents((current) => {
-      const completed = current.map((item) =>
-        item.status === "active" ? { ...item, status: "complete" as const } : item,
-      );
-      const existing = completed.findIndex((item) => item.id === event.id);
-      const next = { ...event, status: "active" as const };
-      if (existing < 0) return [...completed, next];
-      return [...completed.filter((_, index) => index !== existing), next];
-    });
-  }
-
-  async function beginResearch() {
+  function beginResearch() {
     const message = input.trim();
     if (!message || researching) return;
-    setResearching(true);
-    setElapsed(0);
-    setAgentEvents([]);
-    setAgentTranscript("");
-    setError(undefined);
-    try {
-      const response = await fetch("/api/onboard", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
-      });
-      if (!response.ok) {
-        const body = await response.json();
-        throw new Error(body.error ?? "I couldn’t research that company yet.");
-      }
-      if (!response.body) throw new Error("The research stream did not start.");
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let receivedResult = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as
-            | ({ type: "progress" } & Omit<OnboardingProgress, "status">)
-            | { type: "transcript"; text: string }
-            | OnboardingApiResponse
-            | { type: "error"; message: string };
-          if (event.type === "progress") {
-            recordProgress(event);
-          } else if (event.type === "transcript") {
-            setAgentTranscript(event.text);
-          } else if (event.type === "error") {
-            throw new Error(event.message);
-          } else if (event.type === "result") {
-            receivedResult = true;
-            setAgentEvents((current) =>
-              current.map((item) => ({ ...item, status: "complete" as const })),
-            );
-            onComplete(event.state);
-            return;
-          }
-        }
-        if (done) break;
-      }
-      if (!receivedResult) throw new Error("The research stream ended before the plan was ready.");
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "I couldn’t research that company yet.";
-      setError(message);
-      setAgentEvents((current) =>
-        current.map((item, index) => ({
-          ...item,
-          status: index === current.length - 1 ? "error" as const : "complete" as const,
-        })),
-      );
-      setResearching(false);
-    }
+    onSubmit(message);
   }
 
   const suggestions = [
@@ -241,8 +194,8 @@ function Onboarding({ onComplete }: { onComplete: (state: MadeThisState) => void
           <span className="onboarding-kicker"><span /> Your go-to-market agent</span>
           <h1 id="onboarding-title">I’m your CMO.<br />{" "}Let’s work out your marketing.</h1>
           <p>
-            Tell me what you’re building or paste your website. I’ll research the company,
-            understand the market, and turn it into a plan you can see and use.
+            Tell me what you’re building or paste your website. I’ll identify the company,
+            open the workspace, and keep checking market evidence in the background.
           </p>
         </div>
 
@@ -273,7 +226,10 @@ function Onboarding({ onComplete }: { onComplete: (state: MadeThisState) => void
             <span>
               {researching ? (
                 <>
-                  <Radio size={14} /> {latestEvent?.title ?? "Live agent stream below"}
+                  <Radio size={14} />{" "}
+                  {elapsed < 10
+                    ? `Live briefing · workspace opens in ${10 - elapsed}s`
+                    : latestEvent?.title ?? "Opening your workspace"}
                 </>
               ) : (
                 <>
@@ -333,6 +289,28 @@ function Onboarding({ onComplete }: { onComplete: (state: MadeThisState) => void
         <span>Powered by Cursor Agent CLI</span>
       </footer>
     </main>
+  );
+}
+
+function MarketResearchBanner({ research }: { research: MarketResearchStatus }) {
+  const latest = research.events.at(-1);
+  return (
+    <section className="market-research-banner" aria-label="Live market evidence" aria-live="polite">
+      <header>
+        <div>
+          <span className="live-dot" />
+          <strong>{latest?.title ?? "Checking market evidence"}</strong>
+        </div>
+        <time>{research.active ? `${research.elapsed}s · working` : research.error ? "paused" : "updated"}</time>
+      </header>
+      <p>{latest?.detail ?? "Reviewing public company and category sources"}</p>
+      {research.transcript && <small>{research.transcript}</small>}
+      {research.error && (
+        <div className="market-research-error">
+          <AlertTriangle size={13} /> {research.error}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -413,10 +391,16 @@ function OpportunityRow({
           <StatusPill tone={opportunity.fitLabel === "High fit" ? "violet" : "gray"}>
             {opportunity.fitLabel}
           </StatusPill>
+          {opportunity.prospectStatus && (
+            <StatusPill tone={opportunity.prospectStage === "cold" ? "gray" : "green"}>
+              {opportunity.source === "linkedin_search" ? <Linkedin size={10} /> : null}
+              {opportunity.prospectStatus}
+            </StatusPill>
+          )}
         </span>
         <span>{opportunity.signal}</span>
         <small>
-          {winner?.name} · {opportunity.signalAge}
+          {opportunity.target} · {opportunity.targetRole} · {winner?.name} · {opportunity.signalAge}
         </small>
       </span>
       <span className="score-ring" style={{ "--score": opportunity.score.total } as React.CSSProperties}>
@@ -586,10 +570,10 @@ function MarketingPlanDiagram({ plan }: { plan: MarketingPlan }) {
                     {step.status}
                   </span>
                 </div>
-                <small>{step.workstream} · {step.difficulty}</small>
+                <small>{step.workstream} · {step.difficulty}{step.subagent ? ` · ${step.subagent.name}` : ""}</small>
                 <h3>{step.title}</h3>
                 <p>{step.description}</p>
-                <footer><Target size={11} /> {step.expectedOutcome}</footer>
+                <footer><Target size={11} /> {step.subagent?.statusRead ?? step.expectedOutcome}</footer>
               </article>
               {index < plan.steps.length - 1 && <ArrowRight className="plan-connector" size={16} aria-hidden="true" />}
             </div>
@@ -598,7 +582,7 @@ function MarketingPlanDiagram({ plan }: { plan: MarketingPlan }) {
         <div className="plan-choice-note">
           <MessageSquare size={13} />
           {plan.status === "awaiting_choice"
-            ? "Choose a numbered priority in the CMO chat to execute it."
+            ? "Choose a numbered priority in the CMO chat. The CMO spawns a subagent to do that one task."
             : "The diagram updates as each governed priority advances."}
         </div>
       </div>
@@ -612,12 +596,14 @@ function CommandCenter({
   command,
   openProposal,
   openActivity,
+  marketResearch,
 }: {
   state: MadeThisState;
   busy: boolean;
   command: (command: Command) => void;
   openProposal: () => void;
   openActivity: () => void;
+  marketResearch?: MarketResearchStatus;
 }) {
   const activeProposal = state.proposals.find((item) => item.id === state.activeProposalId);
   const activeMarketingPlan = state.marketingPlans.find(
@@ -667,6 +653,10 @@ function CommandCenter({
           <span>{state.lastNotice.message}</span>
           <small>SIMULATION</small>
         </div>
+      )}
+
+      {(marketResearch?.active || marketResearch?.error) && (
+        <MarketResearchBanner research={marketResearch} />
       )}
 
       {state.mode === "autopilot" && (
@@ -773,7 +763,11 @@ function CommandCenter({
           <article className="panel queue-panel">
             <div className="panel-heading compact">
               <div>
-                <span className="section-kicker">Live opportunity scan</span>
+                <span className="section-kicker">
+                  {state.opportunities.some((item) => item.source === "linkedin_search")
+                    ? "LinkedIn prospect status"
+                    : "Live opportunity scan"}
+                </span>
                 <h2>Priority accounts</h2>
               </div>
               <StatusPill tone="gray">{state.opportunities.length} tracked</StatusPill>
@@ -1043,7 +1037,7 @@ function ChatPlanFeedback({
             aria-label={`Execute priority ${step.priority}: ${step.title}`}
           >
             <span>{step.status === "completed" ? <Check size={11} /> : String(step.priority).padStart(2, "0")}</span>
-            <span><strong>{step.title}</strong><small>{step.workstream} · {step.difficulty}</small></span>
+            <span><strong>{step.title}</strong><small>{step.workstream} · {step.difficulty}{executingStepId === step.id ? " · spawning subagent" : ""}</small></span>
             {executingStepId === step.id ? <span className="spinner dark" /> : <ChevronRight size={13} />}
           </button>
         ))}
@@ -1057,13 +1051,13 @@ function ChatRail({
   open,
   close,
   onStateChange,
-  onExecutePlanStep,
+  marketResearch,
 }: {
   state: MadeThisState;
   open: boolean;
   close: () => void;
   onStateChange: (state: MadeThisState) => void;
-  onExecutePlanStep: (planId: string, stepId: string) => Promise<MadeThisState | undefined>;
+  marketResearch?: MarketResearchStatus;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const profile = state.companyProfile;
@@ -1077,7 +1071,9 @@ function ChatRail({
       {
         id: "welcome",
         role: "agent",
-        content: `I’ve mapped ${profile.name} in ${profile.category}. The first plan is on the canvas now. My opening bet: sharpen the message for ${profile.audience.toLowerCase()}, then prove it in one focused channel.`,
+        content: marketResearch?.active
+          ? `I’ve opened the ${profile.name} workspace from your brief. I’m still checking market evidence and will update the plan. Priority 1 is finding prospect clients; I can spawn a subagent to do that task.`
+          : `I’ve mapped ${profile.name} in ${profile.category}. The first plan is on the canvas now. Priority 1 is finding prospect clients; I can spawn a subagent to do that task.`,
         planId: state.activeMarketingPlanId,
       },
     ];
@@ -1087,10 +1083,37 @@ function ChatRail({
   const [executingStepId, setExecutingStepId] = useState<string>();
   const [connection, setConnection] = useState<"ready" | "working" | "error">("ready");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const latestResearch = marketResearch?.events.at(-1);
+  const agentWorking = Boolean(thinking || executingStepId || marketResearch?.active);
+  const workingLabel = thinking
+    ? "Answering your message"
+    : executingStepId
+      ? "Spawning a subagent for this priority"
+      : latestResearch
+        ? `${latestResearch.title}${latestResearch.detail ? ` · ${latestResearch.detail}` : ""}`
+        : "Checking market evidence";
+  const connectionStatus = connection === "error" && !agentWorking ? "error" : agentWorking ? "working" : "ready";
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [messages, thinking, state.activeMarketingPlanId]);
+  }, [messages, thinking, executingStepId, state.activeMarketingPlanId, marketResearch?.transcript, agentWorking, workingLabel]);
+
+  useEffect(() => {
+    const reply = marketResearch?.completedReply;
+    if (!reply || marketResearch?.active) return;
+    setMessages((current) => {
+      if (current.some((message) => message.id === "market-evidence")) return current;
+      return [
+        ...current,
+        {
+          id: "market-evidence",
+          role: "agent",
+          content: reply,
+          planId: state.activeMarketingPlanId,
+        },
+      ];
+    });
+  }, [marketResearch?.active, marketResearch?.completedReply, state.activeMarketingPlanId]);
 
   async function sendMessage(prefilled?: string) {
     const content = (prefilled ?? input).trim();
@@ -1159,10 +1182,20 @@ function ChatRail({
       },
     ]);
     try {
-      const nextState = await onExecutePlanStep(plan.id, step.id);
-      if (!nextState) throw new Error("The plan priority could not be executed.");
+      const response = await fetch("/api/plan-task", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId: plan.id, stepId: step.id }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "The plan priority could not be executed.");
+      const nextState = body.state as MadeThisState;
+      onStateChange(nextState);
       const nextPlan = nextState.marketingPlans.find((item) => item.id === plan.id);
       const nextStep = nextPlan?.steps.find((item) => item.id === step.id);
+      const subagentLine = nextStep?.subagent
+        ? ` I spawned the ${nextStep.subagent.name} subagent to do this task.`
+        : "";
       setMessages((current) => [
         ...current,
         {
@@ -1170,7 +1203,7 @@ function ChatRail({
           role: "agent",
           content:
             nextStep?.status === "completed"
-              ? `Priority ${step.priority} is complete. I updated the execution map and the ${step.workstream} workstream.`
+              ? `Priority ${step.priority} is complete.${subagentLine} I updated the execution map and the ${step.workstream} workstream.`
               : `Priority ${step.priority} is ${nextStep?.status ?? "not available"}. ${nextStep?.executionNote ?? "Review the dashboard notice before retrying."}`,
           receipt: nextStep?.executionNote,
         },
@@ -1199,10 +1232,17 @@ function ChatRail({
   return (
     <aside className={`chat-rail ${open ? "chat-rail-open" : ""}`} aria-label="MadeThis CMO conversation">
       <header className="chat-header">
-        <div className="chat-agent-avatar"><BrandMark /></div>
+        <div className={`chat-agent-avatar ${agentWorking ? "is-working" : ""}`}><BrandMark /></div>
         <div>
           <strong>MadeThis CMO</strong>
-          <span className={`chat-connection chat-connection-${connection}`}><i /> Cursor CLI · {connection}</span>
+          <span className={`chat-connection chat-connection-${connectionStatus}`}>
+            <i />
+            {connectionStatus === "working"
+              ? `CMO is working${marketResearch?.active ? ` · ${marketResearch.elapsed}s` : ""}`
+              : connectionStatus === "error"
+                ? "Cursor CLI · error"
+                : "Cursor CLI · ready"}
+          </span>
         </div>
         <button className="chat-mobile-close" aria-label="Close conversation" onClick={close}><X size={18} /></button>
       </header>
@@ -1251,6 +1291,16 @@ function ChatRail({
           </div>
         )}
         {thinking && <div className="chat-message chat-message-agent"><span className="message-agent-mark"><Sparkles size={13} /></span><div><span>CMO</span><p className="typing-dots"><i /><i /><i /></p></div></div>}
+        {marketResearch?.active && !thinking && (
+          <div className="chat-message chat-message-agent">
+            <span className="message-agent-mark"><Sparkles size={13} /></span>
+            <div>
+              <span>CMO · still working</span>
+              <p>{workingLabel}</p>
+              {marketResearch.transcript && <small className="chat-action-receipt">{marketResearch.transcript}</small>}
+            </div>
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
@@ -1260,7 +1310,18 @@ function ChatRail({
         ))}
       </div>
 
-      <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}>
+      {agentWorking && (
+        <div className="chat-working" role="status" aria-live="polite">
+          <span className="spinner dark" />
+          <div>
+            <strong>CMO is still working</strong>
+            <small>{workingLabel}</small>
+          </div>
+          <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
+        </div>
+      )}
+
+      <form className={`chat-composer ${agentWorking ? "is-working" : ""}`} onSubmit={(event) => { event.preventDefault(); sendMessage(); }}>
         <textarea
           value={input}
           onChange={(event) => setInput(event.target.value)}
@@ -1270,12 +1331,18 @@ function ChatRail({
               sendMessage();
             }
           }}
-          placeholder="Tell your CMO what to do..."
+          placeholder={agentWorking ? "You can still message the CMO while it works..." : "Tell your CMO what to do..."}
           aria-label="Message MadeThis CMO"
           rows={3}
         />
         <div>
-          <span><Sparkles size={11} /> Cursor has your company context</span>
+          <span>
+            {agentWorking ? (
+              <><span className="live-dot" /> CMO is still working</>
+            ) : (
+              <><Sparkles size={11} /> Cursor has your company context</>
+            )}
+          </span>
           <button type="submit" className="composer-send" aria-label="Send message" disabled={!input.trim() || thinking}><ArrowRight size={16} /></button>
         </div>
       </form>
@@ -1401,6 +1468,28 @@ export default function Home() {
   const [chatOpen, setChatOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [marketResearch, setMarketResearch] = useState<MarketResearchStatus>({
+    active: false,
+    elapsed: 0,
+    events: [],
+    transcript: "",
+  });
+  const onboardAbort = useRef<AbortController | undefined>(undefined);
+  const pendingWorkspace = useRef<MadeThisState | undefined>(undefined);
+  const onboardHoldElapsed = useRef(false);
+  const onboardHoldTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  function clearOnboardHold() {
+    if (onboardHoldTimer.current) window.clearTimeout(onboardHoldTimer.current);
+    onboardHoldTimer.current = undefined;
+    onboardHoldElapsed.current = false;
+    pendingWorkspace.current = undefined;
+  }
+
+  function revealWorkspace(next: MadeThisState) {
+    pendingWorkspace.current = next;
+    if (onboardHoldElapsed.current) setState(next);
+  }
 
   useEffect(() => {
     fetch("/api/state", { cache: "no-store" })
@@ -1412,12 +1501,128 @@ export default function Home() {
       .catch((caught: Error) => setError(caught.message));
   }, []);
 
+  useEffect(() => {
+    if (!marketResearch.active) return;
+    const timer = window.setInterval(() => {
+      setMarketResearch((current) => ({ ...current, elapsed: current.elapsed + 1 }));
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [marketResearch.active]);
+
   const activeProposal = useMemo(
     () => state?.proposals.find((item) => item.id === state.activeProposalId),
     [state],
   );
 
+  async function startOnboard(message: string) {
+    onboardAbort.current?.abort();
+    clearOnboardHold();
+    const controller = new AbortController();
+    onboardAbort.current = controller;
+    setError(undefined);
+    setMarketResearch({ active: true, elapsed: 0, events: [], transcript: "" });
+    onboardHoldTimer.current = window.setTimeout(() => {
+      onboardHoldElapsed.current = true;
+      if (pendingWorkspace.current) setState(pendingWorkspace.current);
+    }, ONBOARD_HOLD_MS);
+    let openedWorkspace = false;
+    try {
+      const response = await fetch("/api/onboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const body = await response.json();
+        throw new Error(body.error ?? "I couldn’t research that company yet.");
+      }
+      if (!response.body) throw new Error("The research stream did not start.");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finishedResearch = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line) as
+            | ({ type: "progress" } & Omit<OnboardingProgress, "status">)
+            | { type: "transcript"; text: string }
+            | OnboardingApiResponse
+            | { type: "error"; message: string }
+            | { type: "research_error"; message: string };
+          if (event.type === "progress") {
+            setMarketResearch((current) => ({
+              ...current,
+              events: upsertProgress(current.events, event),
+            }));
+          } else if (event.type === "transcript") {
+            setMarketResearch((current) => ({ ...current, transcript: event.text }));
+          } else if (event.type === "error") {
+            throw new Error(event.message);
+          } else if (event.type === "research_error") {
+            setMarketResearch((current) => ({
+              ...current,
+              active: false,
+              error: event.message,
+              events: current.events.map((item, index) => ({
+                ...item,
+                status: index === current.events.length - 1 ? ("error" as const) : item.status,
+              })),
+            }));
+            return;
+          } else if (event.type === "workspace" || event.type === "result") {
+            openedWorkspace = true;
+            revealWorkspace(event.state);
+            if (event.type === "result") {
+              finishedResearch = true;
+              setMarketResearch((current) => ({
+                ...current,
+                active: false,
+                completedReply: event.reply,
+                events: current.events.map((item) => ({ ...item, status: "complete" as const })),
+              }));
+            }
+          }
+        }
+        if (done) break;
+      }
+      if (!openedWorkspace) throw new Error("The research stream ended before the company workspace was ready.");
+      if (!finishedResearch) {
+        setMarketResearch((current) => ({
+          ...current,
+          active: false,
+          error: current.error ?? "Market evidence stopped before the plan was updated.",
+        }));
+      }
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      const message = caught instanceof Error ? caught.message : "I couldn’t research that company yet.";
+      setMarketResearch((current) => ({
+        ...current,
+        active: false,
+        error: message,
+        events: current.events.map((item, index) => ({
+          ...item,
+          status: index === current.events.length - 1 ? ("error" as const) : "complete" as const,
+        })),
+      }));
+      if (!openedWorkspace) setError(message);
+    }
+  }
+
   async function command(nextCommand: Command): Promise<MadeThisState | undefined> {
+    if (nextCommand.type === "new_user" || nextCommand.type === "reset") {
+      onboardAbort.current?.abort();
+      clearOnboardHold();
+      setMarketResearch({ active: false, elapsed: 0, events: [], transcript: "" });
+    }
     setBusy(true);
     setError(undefined);
     try {
@@ -1446,7 +1651,18 @@ export default function Home() {
   }
 
   if (!state) return <LoadingState />;
-  if (!state.companyProfile) return <Onboarding onComplete={setState} />;
+  if (!state.companyProfile) {
+    return (
+      <Onboarding
+        researching={marketResearch.active}
+        elapsed={marketResearch.elapsed}
+        agentEvents={marketResearch.events}
+        agentTranscript={marketResearch.transcript}
+        error={marketResearch.error ?? error}
+        onSubmit={startOnboard}
+      />
+    );
+  }
 
   const companyInitials = initials(state.companyProfile.name).slice(0, 2);
 
@@ -1480,11 +1696,11 @@ export default function Home() {
         <header className="topbar">
           <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button>
           <div className="breadcrumbs"><span>{state.companyProfile.name}</span><ChevronRight size={13} /><strong>{nav === "command" ? "Command center" : nav === "playbook" ? "Playbook" : "Activity"}</strong></div>
-          <div className="topbar-status"><StatusPill tone="amber"><Radio size={10} /> simulation</StatusPill><div className="mode-switch" aria-label="Agent mode"><button className={state.mode === "propose" ? "active" : ""} onClick={() => command({ type: "set_mode", mode: "propose" })}>Propose</button><button className={state.mode === "autopilot" ? "active" : ""} onClick={() => command({ type: "set_mode", mode: "autopilot" })}><Sparkles size={11} /> Autopilot</button></div><span className={`agent-health health-${state.status}`}><i /> {state.status}</span><button className="chat-toggle" onClick={() => setChatOpen(true)} aria-label="Open CMO conversation"><MessageSquare size={16} /><span>Ask CMO</span></button></div>
+          <div className="topbar-status">{marketResearch.active && <StatusPill tone="violet"><Radio size={10} /> checking market evidence</StatusPill>}<StatusPill tone="amber"><Radio size={10} /> simulation</StatusPill><div className="mode-switch" aria-label="Agent mode"><button className={state.mode === "propose" ? "active" : ""} onClick={() => command({ type: "set_mode", mode: "propose" })}>Propose</button><button className={state.mode === "autopilot" ? "active" : ""} onClick={() => command({ type: "set_mode", mode: "autopilot" })}><Sparkles size={11} /> Autopilot</button></div><span className={`agent-health health-${state.status}`}><i /> {state.status}</span><button className={`chat-toggle ${marketResearch.active ? "is-working" : ""}`} onClick={() => setChatOpen(true)} aria-label={marketResearch.active ? "Open CMO conversation, agent is still working" : "Open CMO conversation"}>{marketResearch.active ? <span className="live-dot" /> : <MessageSquare size={16} />}<span>{marketResearch.active ? "CMO working" : "Ask CMO"}</span></button></div>
         </header>
         <div className="page-content">
           {error && <div className="error-banner"><AlertTriangle size={16} /> {error}<button aria-label="Dismiss error" onClick={() => setError(undefined)}><X size={14} /></button></div>}
-          {nav === "command" && <CommandCenter state={state} busy={busy} command={command} openProposal={() => activeProposal && setDrawerOpen(true)} openActivity={() => setNav("activity")} />}
+          {nav === "command" && <CommandCenter state={state} busy={busy} command={command} openProposal={() => activeProposal && setDrawerOpen(true)} openActivity={() => setNav("activity")} marketResearch={marketResearch} />}
           {nav === "playbook" && <Playbook state={state} busy={busy} command={command} />}
           {nav === "activity" && <ActivityTrail state={state} />}
         </div>
@@ -1492,12 +1708,12 @@ export default function Home() {
 
       {chatOpen && <button className="chat-scrim" aria-label="Close CMO conversation" onClick={() => setChatOpen(false)} />}
       <ChatRail
-        key={state.companyProfile.researchedAt}
+        key={state.companyProfile.originalBrief}
         state={state}
         open={chatOpen}
         close={() => setChatOpen(false)}
         onStateChange={setState}
-        onExecutePlanStep={(planId, stepId) => command({ type: "execute_plan_step", planId, stepId })}
+        marketResearch={marketResearch}
       />
 
       {drawerOpen && activeProposal && <ProposalDrawer key={`${activeProposal.id}:${activeProposal.payloadHash}`} proposal={activeProposal} state={state} busy={busy} close={() => setDrawerOpen(false)} command={command} />}

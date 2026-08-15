@@ -28,6 +28,14 @@ const commandSchema = z.discriminatedUnion("type", [
     type: z.literal("execute_plan_step"),
     planId: z.string().min(1),
     stepId: z.string().min(1),
+    subagent: z
+      .object({
+        name: z.string().min(1),
+        summary: z.string().min(1),
+        findings: z.array(z.string().min(1)).max(6),
+        statusRead: z.string().min(1),
+      })
+      .optional(),
   }),
   z.object({ type: z.literal("disable_rule"), ruleId: z.string().min(1) }),
   z.object({ type: z.literal("enable_rule"), ruleId: z.string().min(1) }),

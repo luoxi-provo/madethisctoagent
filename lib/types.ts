@@ -44,6 +44,10 @@ export interface Opportunity {
   score: ScoreBreakdown;
   paths: RelationshipPath[];
   status: "ready" | "active" | "won" | "watching";
+  prospectStatus?: string;
+  prospectStage?: "hiring" | "active" | "open" | "warming" | "cold";
+  source?: "seed" | "linkedin_search";
+  linkedinUrl?: string;
 }
 
 export interface Proposal {
@@ -175,6 +179,7 @@ export interface MarketingWorkstream {
 }
 
 export type MarketingPlanActionType =
+  | "linkedin_prospect_search"
   | "research_brief"
   | "content_draft"
   | "campaign_outline"
@@ -207,6 +212,12 @@ export interface MarketingPlanStep extends MarketingPlanDraftStep {
   status: MarketingPlanStepStatus;
   executionNote?: string;
   completedAt?: string;
+  subagent?: {
+    name: string;
+    summary: string;
+    findings: string[];
+    statusRead: string;
+  };
 }
 
 export interface MarketingPlan {
@@ -298,6 +309,7 @@ export type Command =
   | { type: "reset" }
   | { type: "new_user" }
   | { type: "onboard_company"; profile: CompanyProfile; draft: MarketingPlanDraft }
+  | { type: "apply_market_evidence"; profile: CompanyProfile; draft: MarketingPlanDraft }
   | { type: "run_heartbeat" }
   | { type: "reject"; proposalId: string; rationale: string }
   | { type: "edit"; proposalId: string; message: string }
@@ -308,7 +320,17 @@ export type Command =
   | { type: "stop" }
   | { type: "set_mode"; mode: Mode }
   | { type: "create_marketing_plan"; draft: MarketingPlanDraft }
-  | { type: "execute_plan_step"; planId: string; stepId: string }
+  | {
+      type: "execute_plan_step";
+      planId: string;
+      stepId: string;
+      subagent?: {
+        name: string;
+        summary: string;
+        findings: string[];
+        statusRead: string;
+      };
+    }
   | { type: "disable_rule"; ruleId: string }
   | { type: "enable_rule"; ruleId: string }
   | { type: "decide_change"; changeId: string; decision: "approved" | "rejected" }
